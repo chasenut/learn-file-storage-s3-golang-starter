@@ -23,7 +23,7 @@ type apiConfig struct {
 	s3Bucket         string
 	s3Region         string
 	s3CfDistribution string
-	s3Client		 *s3.Client
+	s3Client         *s3.Client
 	port             string
 }
 
@@ -96,7 +96,7 @@ func main() {
 		s3Bucket:         s3Bucket,
 		s3Region:         s3Region,
 		s3CfDistribution: s3CfDistribution,
-		s3Client:		  s3Client,
+		s3Client:         s3Client,
 		port:             port,
 	}
 

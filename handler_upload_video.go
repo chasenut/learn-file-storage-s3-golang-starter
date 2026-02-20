@@ -1,13 +1,16 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/base64"
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
+	"path"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
@@ -15,8 +18,8 @@ import (
 )
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
-	const maxMemory = 1 << 30
-	r.Body = http.MaxBytesReader(w, r.Body, maxMemory)
+	const uploadLimit = 1 << 30
+	r.Body = http.MaxBytesReader(w, r.Body, uploadLimit)
 
 	videoIDString := r.PathValue("videoID")
 	videoID, err := uuid.Parse(videoIDString)
@@ -63,34 +66,48 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	temp, err := os.CreateTemp("", "tubely-upload.mp4")
+	tempFile, err := os.CreateTemp("", "tubely-upload.mp4")
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't save temporary file", err)
 		return
 	}
-	defer os.Remove(temp.Name())
-	defer temp.Close()
+	defer os.Remove(tempFile.Name())
+	defer tempFile.Close()
 
-	_, err = io.Copy(temp, file)
+	_, err = io.Copy(tempFile, file)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't write to temporary file", err)
 		return
 	}
 
-	_, err = temp.Seek(0, io.SeekStart)
+	_, err = tempFile.Seek(0, io.SeekStart)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't change temporary file offset", err)
 		return
 	}
 
-	key := make([]byte, 32)
-	rand.Read(key)
-	keyString := fmt.Sprintf("%s.mp4", base64.URLEncoding.EncodeToString(key))
+	directory := ""
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't get video aspect ratio", err)
+		return
+	}
+	switch aspectRatio {
+	case "16:9":
+		directory = "landscape"
+	case "9:16":
+		directory = "portrait"
+	default:
+		directory = "other"
+	}
+
+	key := getAssetPath(mediaType)
+	key = path.Join(directory, key)
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket: &cfg.s3Bucket,
-		Key: &keyString,
-		Body: temp,
+		Key: &key,
+		Body: tempFile,
 		ContentType: &mediaType,
 	})
 	if err != nil {
@@ -98,7 +115,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	url := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, keyString)
+	url := cfg.getObjectURL(key)
 	video.VideoURL = &url
 
 	err = cfg.db.UpdateVideo(video)
@@ -108,4 +125,44 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, nil)
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe", 
+		"-v", "error", 
+		"-print_format", "json", 
+		"-show_streams", 
+		filePath,
+	)
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("ffprobe error: %v", err)
+	}
+
+	var output struct {
+		Streams []struct {
+			Width 	int `json:"width"`
+			Height 	int `json:"height"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		return "", fmt.Errorf("couldn't parse ffprobe output: %v", err)
+	}
+
+	if len(output.Streams) == 0 {
+		return "", errors.New("no video streams found")
+	}
+
+	width := output.Streams[0].Width
+	height := output.Streams[0].Height
+
+	if width == 16*height/9 {
+		return "16:9", nil
+	} else if height == 16*width/9 {
+		return "9:16", nil
+	}
+	return "other", nil
 }
